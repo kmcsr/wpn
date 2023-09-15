@@ -42,7 +42,6 @@ func (e *StatusError)Error()(string){
 }
 
 
-
 type ConnStatus byte
 
 const (
@@ -59,8 +58,17 @@ const (
 	StatusClosed ConnStatus = 0xff
 )
 
+type Dialer func(ctx context.Context, protocol string, target string)(net.Conn, error)
+
+func dialContext(ctx context.Context, protocol string, target string)(net.Conn, error){
+	return net.Dial(protocol, target)
+}
+
+var _ Dialer = dialContext
+
 type Conn struct {
 	PingInterval time.Duration
+	Dialer Dialer
 
 	ctx    context.Context
 	cancel context.CancelCauseFunc
@@ -127,6 +135,18 @@ func (c *Conn)Lock()(ok bool){
 	return true
 }
 
+// Unlock will unlock the connection if it's locked and return true, or it will return false
+func (c *Conn)Unlock()(ok bool){
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if c.status != StatusLocked {
+		return false
+	}
+	c.status = StatusIdle
+	return true
+}
+
 func (c *Conn)closeWithErr(err error){
 	c.closeWithCode(websocket.StatusInternalError, err)
 }
@@ -178,6 +198,98 @@ func (c *Conn)sendCmd(cmd string)(err error){
 	return
 }
 
+func (c *Conn)handleCommand(cmd string)(err error){
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	switch cmd[0] {
+	case cmdClose:
+		c.status = StatusIdle
+		if c.streamConn != nil {
+			c.streamConn.Close()
+			c.streamConn = nil
+		}
+		if err = c.sendCmd(cmdReplyS); err != nil {
+			c.closeWithErr(err)
+			return
+		}
+	case cmdOpenPacket:
+		if c.status != StatusIdle {
+			c.closeWithCode(websocket.StatusInvalidFramePayloadData, ErrIllegalStatus)
+			return
+		}
+		c.status = StatusPacket
+	case cmdOpenStream:
+		if c.status != StatusIdle {
+			c.closeWithCode(websocket.StatusInvalidFramePayloadData, ErrIllegalStatus)
+			return
+		}
+		protocol, target := split(cmd[1:], ';')
+		if c.OnCheckIncoming != nil && !c.OnCheckIncoming(protocol, target) {
+			if err = c.sendCmd(cmdRFalseS + "Incoming request blocked"); err != nil {
+				return
+			}
+			return
+		}
+		dialer := c.Dialer
+		if dialer == nil {
+			dialer = dialContext
+		}
+		var conn net.Conn
+		if conn, err = dialer(c.ctx, protocol, target); err != nil {
+			if err = c.sendCmd(cmdRFalseS + err.Error()); err != nil {
+				return
+			}
+			return
+		}
+		if err = c.sendCmd(cmdRTrueS + conn.LocalAddr().String()); err != nil {
+			conn.Close()
+			return
+		}
+		c.status = StatusStream
+		c.streamConn = conn
+		go c.serveStream(conn)
+	case cmdReply:
+		if c.onResult != nil {
+			if len(cmd) == 1 {
+				c.onResult(false, "")
+			}else{
+				c.onResult(cmd[1] == cmdTrue, cmd[2:])
+			}
+		}
+	case cmdError:
+		if c.status != StatusIdle {
+			if c.onCmdErr != nil {
+				c.onCmdErr(cmd[1:])
+			}
+		}
+	}
+	return
+}
+
+func (c *Conn)handleBinary(r io.Reader)(err error){
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	switch c.status {
+	case StatusPacket:
+		// TODO
+	case StatusStream:
+		if c.streamConn == nil {
+			return
+		}
+		_, err = io.Copy(c.streamConn, r)
+		if err != nil {
+			c.status = StatusIdle
+			c.streamConn.Close()
+			c.streamConn = nil
+			if err = c.sendCmd(cmdErrorS + err.Error()); err != nil {
+				return
+			}
+		}
+	}
+	return
+}
+
 // will automatically close connection if an error occurred
 func (c *Conn)Handle()(err error){
 	if c.PingInterval > 0 {
@@ -215,105 +327,34 @@ func (c *Conn)Handle()(err error){
 			return
 		}
 		if typ == websocket.MessageText {
-			var buf0 []byte
-			buf0, err = io.ReadAll(r)
+			var buf []byte
+			buf, err = io.ReadAll(r)
 			if err != nil {
 				c.closeWithErr(err)
 				return
 			}
-			buf := (string)(buf0)
-			c.lock.Lock()
-			switch buf[0] {
-			case cmdClose:
-				c.status = StatusIdle
-				if c.streamConn != nil {
-					c.streamConn.Close()
-					c.streamConn = nil
-				}
-				if err = c.sendCmd(cmdReplyS); err != nil {
-					c.closeWithErr(err)
-					return
-				}
-			case cmdOpenPacket:
-				if c.status != StatusIdle {
-					c.lock.Unlock()
-					c.closeWithCode(websocket.StatusInvalidFramePayloadData, ErrIllegalStatus)
-					return
-				}
-				c.status = StatusPacket
-			case cmdOpenStream:
-				if c.status != StatusIdle {
-					c.lock.Unlock()
-					c.closeWithCode(websocket.StatusInvalidFramePayloadData, ErrIllegalStatus)
-					return
-				}
-				protocol, target := split(buf[1:], ';')
-				if c.OnCheckIncoming != nil && !c.OnCheckIncoming(protocol, target) {
-					c.lock.Unlock()
-					if err = c.sendCmd(cmdRFalseS + "Incoming request blocked"); err != nil {
-						return
-					}
-					continue
-				}
-				var conn net.Conn
-				if conn, err = net.Dial(protocol, target); err != nil {
-					c.lock.Unlock()
-					if err = c.sendCmd(cmdRFalseS + err.Error()); err != nil {
-						return
-					}
-					continue
-				}
-				if err = c.sendCmd(cmdRTrueS + conn.LocalAddr().String()); err != nil {
-					c.lock.Unlock()
-					conn.Close()
-					return
-				}
-				c.status = StatusStream
-				c.streamConn = conn
-				go c.serveStream(conn)
-			case cmdReply:
-				if c.onResult != nil {
-					if len(buf) == 1 {
-						c.onResult(false, "")
-					}else{
-						c.onResult(buf[1] == cmdTrue, buf[2:])
-					}
-				}
-			case cmdError:
-				if c.status != StatusIdle {
-					if c.onCmdErr != nil {
-						c.onCmdErr(buf[1:])
-					}
-				}
+			if err = c.handleCommand((string)(buf)); err != nil {
+				return
 			}
-			c.lock.Unlock()
 		}else{ // if typ == websocket.MessageBinary
-			c.lock.Lock()
-			switch c.status {
-			case StatusPacket:
-				// TODO
-				c.lock.Unlock()
-			case StatusStream:
-				if c.streamConn == nil {
-					c.lock.Unlock()
-					continue
-				}
-				_, err = io.Copy(c.streamConn, r)
-				if err != nil {
-					c.status = StatusIdle
-					c.streamConn.Close()
-					c.streamConn = nil
-					c.lock.Unlock()
-					if err = c.sendCmd(cmdErrorS + err.Error()); err != nil {
-						return
-					}
-				}else{
-					c.lock.Unlock()
-					err = nil
-				}
+			if err = c.handleBinary(r); err != nil {
+				return
 			}
 		}
 	}
+}
+
+// `Ping` will ping the remote point, return the time used and possible error
+// If an error occured during ping, the connection will be automaticly closed
+// The connection can ping with any status
+func (c *Conn)Ping()(t time.Duration, err error){
+	before := time.Now()
+	if err = c.ws.Ping(c.ctx); err != nil {
+		c.closeWithErr(err)
+		return
+	}
+	t = time.Since(before)
+	return
 }
 
 // `DialContext` will only success if `status` is `StatusIdle` or `StatusLocked`

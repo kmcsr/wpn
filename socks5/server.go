@@ -2,9 +2,14 @@
 package socks5
 
 import (
+	"context"
 	"io"
 	"net"
+	"sync"
+	"time"
 )
+
+// TODO: need a logger as well
 
 const (
 	CmdDialTCP    = 0x01
@@ -16,9 +21,9 @@ const (
 // if Handler returned ErrUnsupportCommand, the server will reply with StatusCommandUnsupported
 //
 type Handler interface {
-	DialTCP(addr *AddrPort)(net.Conn, error)
-	BindTCP(addr *AddrPort)(net.Listener, error)
-	BindUDP(addr *AddrPort)(net.PacketConn, error)
+	DialTCP(ctx context.Context, addr *AddrPort)(net.Conn, error)
+	BindTCP(ctx context.Context, addr *AddrPort)(net.Listener, error)
+	BindUDP(ctx context.Context, addr *AddrPort)(net.PacketConn, error)
 }
 
 const DefaultSocksPort = ":1080"
@@ -29,9 +34,33 @@ type Server struct {
 
 	// If UserGuarder is set, the Username/password auth mode will be enabled
 	UserGuarder UserGuarder
+	DialTimeout time.Duration
+
+	initMux sync.Mutex
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func (s *Server)init(){
+	s.initMux.Lock()
+	defer s.initMux.Unlock()
+	if s.ctx == nil {
+		s.ctx, s.cancel = context.WithCancel(context.Background())
+	}
 }
 
 func (s *Server)Serve(listener net.Listener)(err error){
+	s.init()
+
+	done := make(chan struct{}, 0)
+	go func(){
+		select {
+		case <-done:
+		case <-s.ctx.Done():
+			listener.Close()
+		}
+	}()
+	defer close(done)
 	for {
 		var conn net.Conn
 		if conn, err = listener.Accept(); err != nil {
@@ -66,6 +95,12 @@ func ListenAndServe(addr string, handler Handler)(err error){
 		Handler: handler,
 	}
 	return server.ListenAndServe()
+}
+
+func (s *Server)Shutdown(ctx context.Context)(err error){
+	s.cancel()
+	// TODO: wait for all connections closed
+	return
 }
 
 func (s *Server)tryAuth(c *conn, auth AuthType)(ok bool, err error){
@@ -118,6 +153,17 @@ func (s *Server)tryAuth(c *conn, auth AuthType)(ok bool, err error){
 func (s *Server)Handle(netconn net.Conn)(err error){
 	defer netconn.Close()
 
+	var (
+		ctx context.Context
+		cancel context.CancelFunc
+	)
+	if s.DialTimeout > 0 {
+		ctx, cancel = context.WithTimeout(s.ctx, s.DialTimeout)
+	}else{
+		ctx, cancel = context.WithCancel(s.ctx)
+	}
+	defer cancel()
+
 	// begin handshake & auth
 	c := &conn{
 		Conn: netconn,
@@ -147,11 +193,10 @@ func (s *Server)Handle(netconn net.Conn)(err error){
 	if err != nil {
 		return c.sendErrorResponse(err)
 	}
-
 	switch cmd {
 	case CmdDialTCP:
 		var conn net.Conn
-		if conn, err = s.Handler.DialTCP(addr); err != nil {
+		if conn, err = s.Handler.DialTCP(ctx, addr); err != nil {
 			return c.sendErrorResponse(err)
 		}
 		if err = c.sendResponse(StatusGranted, nil); err != nil {
@@ -163,7 +208,7 @@ func (s *Server)Handle(netconn net.Conn)(err error){
 		return
 	case CmdBindTCP:
 		var listener net.Listener
-		if listener, err = s.Handler.BindTCP(addr); err != nil {
+		if listener, err = s.Handler.BindTCP(ctx, addr); err != nil {
 			return c.sendErrorResponse(err)
 		}
 		var ladr *AddrPort
@@ -194,7 +239,7 @@ func (s *Server)Handle(netconn net.Conn)(err error){
 		break
 
 		var conn net.PacketConn
-		if conn, err = s.Handler.BindUDP(addr); err != nil {
+		if conn, err = s.Handler.BindUDP(ctx, addr); err != nil {
 			return c.sendErrorResponse(err)
 		}
 

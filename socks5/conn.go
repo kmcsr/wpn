@@ -110,6 +110,8 @@ func (c *conn)sendErrorResponse(err error)(error){
 			}else{
 				status = StatusHostUnreachable
 			}
+		}else if strings.Contains(msg, "blocked") || strings.Contains(msg, "not allowed") {
+			status = StatusBlocked
 		}
 	}
 	return c.sendResponse(status, nil)

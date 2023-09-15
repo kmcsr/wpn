@@ -2,6 +2,7 @@
 package wssocks
 
 import (
+	"context"
 	"net"
 
 	"github.com/kmcsr/wpn"
@@ -14,15 +15,15 @@ type Handler struct {
 
 var _ socks5.Handler = (*Handler)(nil)
 
-func (h *Handler)DialTCP(addr *socks5.AddrPort)(net.Conn, error){
-	return h.Client.Dial("tcp", addr.String())
+func (h *Handler)DialTCP(ctx context.Context, addr *socks5.AddrPort)(net.Conn, error){
+	return h.Client.DialContext(ctx, "tcp", addr.String())
 }
 
-func (h *Handler)BindTCP(addr *socks5.AddrPort)(net.Listener, error){
+func (h *Handler)BindTCP(ctx context.Context, addr *socks5.AddrPort)(net.Listener, error){
 	return nil, socks5.ErrUnsupportCommand
 }
 
-func (h *Handler)BindUDP(addr *socks5.AddrPort)(net.PacketConn, error){
+func (h *Handler)BindUDP(ctx context.Context, addr *socks5.AddrPort)(net.PacketConn, error){
 	return nil, socks5.ErrUnsupportCommand
 }
 

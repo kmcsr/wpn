@@ -148,7 +148,7 @@ func (a *AddrPort)ReadFrom(r io.Reader)(n int64, err error){
 	return
 }
 
-func (a *AddrPort)Encode()(buf []byte, err error){
+func (a *AddrPort)MarshalBinary()(buf []byte, err error){
 	if a == nil {
 		return []byte{
 			(byte)(IPv4Addr),
@@ -183,7 +183,7 @@ func (a *AddrPort)Encode()(buf []byte, err error){
 
 func (a *AddrPort)WriteTo(w io.Writer)(n int64, err error){
 	var buf []byte
-	if buf, err = a.Encode(); err != nil {
+	if buf, err = a.MarshalBinary(); err != nil {
 		return
 	}
 	var n0 int
