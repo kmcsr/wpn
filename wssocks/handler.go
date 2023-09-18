@@ -16,7 +16,14 @@ type Handler struct {
 var _ socks5.Handler = (*Handler)(nil)
 
 func (h *Handler)DialTCP(ctx context.Context, addr *socks5.AddrPort)(net.Conn, error){
-	return h.Client.DialContext(ctx, "tcp", addr.String())
+	network := "tcp"
+	switch addr.Type {
+	case socks5.IPv4Addr:
+		network = "tcp4"
+	case socks5.IPv6Addr:
+		network = "tcp6"
+	}
+	return h.Client.DialContext(ctx, network, addr.String())
 }
 
 func (h *Handler)BindTCP(ctx context.Context, addr *socks5.AddrPort)(net.Listener, error){
@@ -24,6 +31,13 @@ func (h *Handler)BindTCP(ctx context.Context, addr *socks5.AddrPort)(net.Listene
 }
 
 func (h *Handler)BindUDP(ctx context.Context, addr *socks5.AddrPort)(net.PacketConn, error){
-	return nil, socks5.ErrUnsupportCommand
+	network := "udp"
+	switch addr.Type {
+	case socks5.IPv4Addr:
+		network = "udp4"
+	case socks5.IPv6Addr:
+		network = "udp6"
+	}
+	return h.Client.ListenPacketContext(ctx, network, addr.String())
 }
 

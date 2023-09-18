@@ -7,14 +7,15 @@ import (
 	"sync"
 )
 
-type stringTCPAddr struct {
-	data string
+type stringAddr struct {
+	network string
+	addr string
 }
 
-var _ net.Addr = (*stringTCPAddr)(nil)
+var _ net.Addr = (*stringAddr)(nil)
 
-func (a *stringTCPAddr)Network()(string){ return "tcp" }
-func (a *stringTCPAddr)String()(string){ return a.data }
+func (a *stringAddr)Network()(string){ return a.network }
+func (a *stringAddr)String()(string){ return a.addr }
 
 type ConnPipe struct {
 	net.Conn

@@ -3,10 +3,8 @@ package wpn
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/http"
-	"sync"
 	"time"
 
 	"nhooyr.io/websocket"
@@ -40,13 +38,12 @@ type Client struct {
 	oldDialOpts *websocket.DialOptions
 	cachedOpts  *websocket.DialOptions
 
-	idleRefreshCh chan struct{}
-
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	connMux sync.Mutex
-	conns   []*Conn
+	idleConns   connPool
+	streamConns connPool
+	packetConns connPool
 }
 
 func NewClient(server string)(c *Client){
@@ -54,29 +51,9 @@ func NewClient(server string)(c *Client){
 		serverURL: server,
 		IdleTimeout: 90 * time.Second,
 		MaxIdleConn: 5,
-		idleRefreshCh: make(chan struct{}, 1),
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
-	go func(){
-		for {
-			if c.IdleTimeout > 0 {
-				select {
-				case <-c.ctx.Done():
-					return
-				case <-time.After(c.IdleTimeout):
-					c.checkConns()
-				case <-c.idleRefreshCh:
-				}
-			}else{
-				select {
-				case <-c.ctx.Done():
-					return
-				case <-c.idleRefreshCh:
-				}
-			}
-		}
-	}()
-	for i := 0; i < 3; i++ {
+	for i := 0; i < c.MaxIdleConn; i++ {
 		c.addIdleConn()
 	}
 	return
@@ -88,15 +65,38 @@ func (c *Client)debugf(format string, args ...any){
 	}
 }
 
-func (c *Client)Shutdown(){
-	c.cancel()
-	c.connMux.Lock()
-	defer c.connMux.Unlock()
-
-	for _, conn := range c.conns {
+func (c *Client)checkConns()(ok bool){
+	for _, conn := range c.idleConns.Clear() {
 		conn.Close()
 	}
-	c.conns = nil
+	return c.streamConns.Len() == 0 && c.packetConns.Len() == 0
+}
+
+func (c *Client)isShutingdown()(bool){
+	return c.ctx.Err() != nil
+}
+
+func (c *Client)Shutdown(ctx context.Context)(err error){
+	c.cancel()
+
+	const pollInterval = time.Millisecond * 50
+	for !c.checkConns() {
+		select {
+		case <-ctx.Done():
+			for _, conn := range c.idleConns.Clear() {
+				conn.Close()
+			}
+			for _, conn := range c.streamConns.Clear() {
+				conn.Close()
+			}
+			for _, conn := range c.packetConns.Clear() {
+				conn.Close()
+			}
+			return context.Cause(ctx)
+		case <-time.After(pollInterval):
+		}
+	}
+	return
 }
 
 func (c *Client)Ping()(t time.Duration, err error){
@@ -104,50 +104,7 @@ func (c *Client)Ping()(t time.Duration, err error){
 	if err != nil {
 		return
 	}
-	defer conn.Unlock()
 	return conn.Ping()
-}
-
-func (c *Client)checkConns(){
-	c.connMux.Lock()
-	defer c.connMux.Unlock()
-
-	if c.ctx.Err() != nil {
-		return
-	}
-
-	idleRemain := 0
-	i, j := 0, len(c.conns)
-	for i < j {
-		for i < j {
-			conn := c.conns[i]
-			if conn.Closed() {
-				break
-			}
-			if conn.Status() == StatusIdle {
-				if idleRemain >= c.MaxIdleConn {
-					conn.Close()
-					break
-				}
-				idleRemain++
-			}
-			i++
-		}
-		for i < j { // idleRemain always greater than zero
-			j--
-			conn := c.conns[j]
-			if conn.Status() == StatusIdle {
-				conn.Close()
-			}else if !conn.Closed() {
-				c.conns[i] = conn
-				break
-			}
-		}
-	}
-	c.conns = c.conns[:j]
-	if idleRemain == 0 {
-		c.addIdleConn()
-	}
 }
 
 func (c *Client)getWebsocketOpts()(opts *websocket.DialOptions){
@@ -194,54 +151,89 @@ func (c *Client)addIdleConn()(err error){
 	if err != nil {
 		return
 	}
-	c.conns = append(c.conns, conn)
+	c.idleConns.Put(conn)
 	return
 }
 
 func (c *Client)getIdleConn()(conn *Conn, err error){
-	select {
-	case c.idleRefreshCh <- struct{}{}:
-	case <-c.ctx.Done():
-		return nil, context.Cause(c.ctx)
-	}
-
-	c.connMux.Lock()
-	defer c.connMux.Unlock()
-
-	for i := len(c.conns) - 1; i >= 0; i-- {
-		conn = c.conns[i]
-		if conn.Lock() {
-			return
-		}
-	}
-	if conn, err = c.newConn(); err != nil {
+	conn = c.idleConns.TakeOr(func()(conn *Conn){
+		conn, err = c.newConn()
 		return
+	})
+	if c.idleConns.Len() * 2 < c.MaxIdleConn {
+		go c.addIdleConn()
 	}
-	if !conn.Lock() {
-		return nil, errors.New("Assert: Idle connection lock failed")
-	}
-	c.conns = append(c.conns, conn)
-	c.addIdleConn()
 	return
 }
 
-func (c *Client)DialContext(ctx context.Context, protocol string, target string)(rw net.Conn, err error){
+func (c *Client)DialContext(ctx context.Context, protocol string, target string)(pipe net.Conn, err error){
 	conn, err := c.getIdleConn()
 	if err != nil {
 		return
 	}
+	defer func(){
+		if c.isShutingdown() {
+			conn.Close()
+			if err == nil {
+				err = context.Cause(c.ctx)
+			}
+		}
+	}()
 	c.debugf("Dialing %s: %q", protocol, target)
-	var pipe *ConnPipe
-	if pipe, err = conn.DialContext(ctx, protocol, target); err != nil {
+	var pp *ConnPipe
+	if pp, err = conn.DialContext(ctx, protocol, target); err != nil {
+		c.idleConns.Put(conn)
 		return
 	}
+	c.streamConns.Put(conn)
 	go func(){
-		c.idleRefreshCh <- <- pipe.AfterClose()
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-pp.AfterClose():
+			c.idleConns.PutFrom(conn, &c.streamConns)
+		}
 	}()
-	rw = pipe
+	pipe = pp
 	return
 }
 
-func (c *Client)Dial(protocol string, target string)(rw net.Conn, err error){
+func (c *Client)Dial(protocol string, target string)(pipe net.Conn, err error){
 	return c.DialContext(context.Background(), protocol, target)
+}
+
+func (c *Client)ListenPacketContext(ctx context.Context, protocol string, target string)(pipe net.PacketConn, err error){
+	conn, err := c.getIdleConn()
+	if err != nil {
+		return
+	}
+	defer func(){
+		if e := c.ctx.Err(); e != nil {
+			conn.Close()
+			if err == nil {
+				err = e
+			}
+		}
+	}()
+	c.debugf("Listening %s: %q", protocol, target)
+	var pp *ConnPacketPipe
+	if pp, err = conn.ListenPacketContext(ctx, protocol, target); err != nil {
+		c.idleConns.Put(conn)
+		return
+	}
+	c.packetConns.Put(conn)
+	go func(){
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-pp.AfterClose():
+			c.idleConns.PutFrom(conn, &c.packetConns)
+		}
+	}()
+	pipe = pp
+	return
+}
+
+func (c *Client)ListenPacket(protocol string, target string)(pipe net.PacketConn, err error){
+	return c.ListenPacketContext(context.Background(), protocol, target)
 }
