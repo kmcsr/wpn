@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"nhooyr.io/websocket"
+	"github.com/kmcsr/wpn/internal/pool"
 )
 
 var (
@@ -326,7 +327,7 @@ func (c *Conn)handleBinary(r io.Reader)(err error){
 		data := &packetDataT{
 			addr: &addr,
 		}
-		buf, data.freeBuf = getIPPktBuf()
+		buf, data.freeBuf = pool.GetIPPacketBuf()
 		var n int
 		if n, err = br.Read(buf); err != nil {
 			if errors.Is(err, io.EOF) {
@@ -533,7 +534,7 @@ func (c *Conn)serveStream()(err error){
 		return
 	}
 	defer conn.Close()
-	buf, freeBuf := getIPPktBuf()
+	buf, freeBuf := pool.GetIPPacketBuf()
 	defer freeBuf()
 	for {
 		var n int
@@ -582,7 +583,7 @@ func (c *Conn)servePacket()(err error){
 		return
 	}
 	defer conn.Close()
-	buf, freeBuf := getIPPktBuf()
+	buf, freeBuf := pool.GetIPPacketBuf()
 	defer freeBuf()
 	for {
 		var (

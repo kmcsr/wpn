@@ -1,4 +1,5 @@
 
+// Copyright (C) 2023  Kevin Z <zyxkad@gmail.com>
 package wssocks
 
 import (

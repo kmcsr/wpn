@@ -1,4 +1,5 @@
 
+// Copyright (C) 2023  Kevin Z <zyxkad@gmail.com>
 package main
 
 import (
@@ -11,8 +12,7 @@ import (
 	"time"
 
 	"github.com/kmcsr/wpn"
-	"github.com/kmcsr/wpn/socks5"
-	"github.com/kmcsr/wpn/wssocks"
+	"github.com/kmcsr/wpn/l2tp"
 )
 
 func main(){
@@ -23,7 +23,7 @@ func main(){
 	{
 		ping, err := client.Ping()
 		if err != nil {
-			loger.Fatalf("Cannot ping the server: %v", err)
+			// loger.Fatalf("Cannot ping the server: %v", err)
 		}
 		loger.Infof("Connected to the server: ping=%v", ping)
 	}
@@ -42,20 +42,16 @@ func main(){
 			}
 		}
 	}()
-	shandler := &wssocks.Handler{
-		Client: client,
-	}
-	server := &socks5.Server{
-		Addr: config.SocksAddr,
-		Handler: shandler,
-		DialTimeout: time.Second * 30,
+	server := &l2tp.Server{
+		// Addr: config.SocksAddr,
+		Logger: loger,
 	}
 
 	go func(){
 		defer close(done)
-		loger.Infof("Starting socks5 server on %q", server.Addr)
+		loger.Infof("Starting L2TP server at %q", server.Addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
-			loger.Fatalf("Error when running socks5 server: %v", err)
+			loger.Fatalf("Error when running L2TP server: %v", err)
 		}
 	}()
 
