@@ -4,7 +4,6 @@ package l2tp
 
 import (
 	"context"
-	"fmt"
 	"net"
 
 	"github.com/kmcsr/go-logger"
@@ -40,10 +39,10 @@ func (s *Server)Serve(conn net.PacketConn)(err error){
 			free()
 			return
 		}
-		go func(buf []byte, free func(), addr net.Addr){
+		go func(buf []byte, free func(), serving net.PacketConn, addr net.Addr){
 			defer free()
-			s.handle(buf, addr)
-		}(buf[:n], free, addr)
+			s.handle(buf, serving, addr)
+		}(buf[:n], free, conn, addr)
 	}
 }
 
@@ -63,7 +62,7 @@ func (s *Server)ListenAndServe()(err error){
 	return s.Serve(conn)
 }
 
-func (s *Server)handle(buf []byte, addr net.Addr){
+func (s *Server)handle(buf []byte, serving net.PacketConn, addr net.Addr){
 	var err error
 	defer func(){
 		if rer := recoverAsError(); rer != nil {
@@ -77,7 +76,7 @@ func (s *Server)handle(buf []byte, addr net.Addr){
 		return
 	}
 	if head.isControl {
-		avps := make(*avpPayload, 0, 3)
+		avps := make([]*avpPayload, 0, 3)
 		for len(buf) > 0 {
 			var avp *avpPayload
 			if avp, buf, err = parseAVP(buf); err != nil {
@@ -86,6 +85,22 @@ func (s *Server)handle(buf []byte, addr net.Addr){
 			avps = append(avps, avp)
 		}
 		_ = avps[0]
+		response := &header{
+			isControl: true,
+			sequence: true,
+			tunnelID: head.tunnelID,
+			sessionID: head.sessionID,
+			ns: head.ns + 1,
+			nr: head.nr + 1,
+		}
+		if buf, err = response.encode(buf[:0]); err != nil {
+			return
+		}
+		if _, err = serving.WriteTo(buf, addr); err != nil {
+			return
+		}
+	}else{
+		println("recv non control msg from:", addr.String())
 	}
 }
 
@@ -105,6 +120,7 @@ func (s *Server)handle(buf []byte, addr net.Addr){
 type header struct {
 	isControl bool
 	priority bool
+	sequence bool
 	tunnelID uint16
 	sessionID uint16
 	/* Ns indicates the sequence number for this data or control message */
@@ -112,6 +128,7 @@ type header struct {
 	/* Nr indicates the sequence number expected in the next control message to be received. */
 	nr uint16
 	length int
+	offset int
 }
 
 const (
@@ -135,7 +152,8 @@ func parseHeader(buf []byte)(head *header, payload []byte, err error){
 	}
 	var (
 		isControl bool = flags & flagType != 0
-		isPriority bool = flags & flagPriority != 0
+		priority bool = flags & flagPriority != 0
+		sequence bool = flags & flagSequence != 0
 		leng int
 		tunnelID uint16
 		sessionID uint16
@@ -152,7 +170,7 @@ func parseHeader(buf []byte)(head *header, payload []byte, err error){
 	tunnelID = ((uint16)(buf[0]) << 8) | (uint16)(buf[1])
 	sessionID = ((uint16)(buf[2]) << 8) | (uint16)(buf[3])
 	buf = buf[4:]
-	if flags & flagSequence != 0 {
+	if sequence {
 		ns = ((uint16)(buf[0]) << 8) | (uint16)(buf[1])
 		nr = ((uint16)(buf[2]) << 8) | (uint16)(buf[3])
 		buf = buf[4:]
@@ -170,16 +188,52 @@ func parseHeader(buf []byte)(head *header, payload []byte, err error){
 	}
 	head = &header{
 		isControl: isControl,
-		priority: isPriority,
+		priority: priority,
+		sequence: sequence,
 		tunnelID: tunnelID,
 		sessionID: sessionID,
 		ns: ns,
 		nr: nr,
 		length: leng,
+		offset: (int)(offset),
 	}
 	payload = buf
 	return
 }
+
+func (head *header)encode(buf []byte)(_ []byte, err error){
+	start := len(buf)
+	var flags uint16 = (uint16)(L2TPVersion)
+	buf = append(buf, 0, 0) // reserve for flags
+	if head.isControl {
+		flags |= flagType
+	}
+	if head.priority {
+		flags |= flagPriority
+	}
+	if head.length != 0 {
+		flags |= flagLength
+		buf = append(buf, (byte)(head.length >> 8), (byte)(head.length & 0xff))
+	}
+	buf = append(buf, (byte)(head.tunnelID >> 8), (byte)(head.tunnelID & 0xff))
+	buf = append(buf, (byte)(head.sessionID >> 8), (byte)(head.sessionID & 0xff))
+	if head.sequence {
+		flags |= flagSequence
+		buf = append(buf, (byte)(head.ns >> 8), (byte)(head.ns & 0xff))
+		buf = append(buf, (byte)(head.nr >> 8), (byte)(head.nr & 0xff))
+	}
+	if head.offset > 0 {
+		flags |= flagOffset
+		buf = append(buf, (byte)(head.offset >> 8), (byte)(head.offset & 0xff))
+		for i := head.offset; i < head.offset; i++ {
+			buf = append(buf, 0xfa)
+		}
+	}
+	buf[start] = (byte)(flags >> 8)
+	buf[start + 1] = (byte)(flags & 0xff)
+	return buf, nil
+}
+
 
 // Each AVP (Attribute-Value Pair) is encoded as:
 //
@@ -211,7 +265,10 @@ func parseAVP(buf []byte)(msg *avpPayload, remain []byte, err error){
 		return nil, nil, WrongLengthErr
 	}
 	flags := ((uint16)(buf[0]) << 8) | (uint16)(buf[1])
-	msg = new(avpPayload)
+	msg = &avpPayload{
+		mandatory: flags & flagMandatory != 0,
+		hidden: flags & flagHidden != 0,
+	}
 	msg.length = (int)(flags & 0x3ff)
 	if msg.length < 6 || len(buf) < msg.length {
 		return nil, nil, WrongLengthErr
@@ -221,4 +278,20 @@ func parseAVP(buf []byte)(msg *avpPayload, remain []byte, err error){
 	msg.value = buf[6:msg.length]
 	remain = buf[msg.length:]
 	return
+}
+
+func (msg *avpPayload)encode(buf []byte)(_ []byte, err error){
+	var flags uint16
+	if msg.mandatory {
+		flags |= flagMandatory
+	}
+	if msg.hidden {
+		flags |= flagHidden
+	}
+	flags |= (uint16)(6 + len(msg.value)) & 0x3ff
+	buf = append(buf, (byte)(flags >> 8), (byte)(flags & 0xff))
+	buf = append(buf, (byte)(msg.vendorID >> 8), (byte)(msg.vendorID & 0xff))
+	buf = append(buf, (byte)(msg.attrType >> 8), (byte)(msg.attrType & 0xff))
+	buf = append(buf, msg.value...)
+	return buf, nil
 }

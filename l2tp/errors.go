@@ -8,7 +8,10 @@ import (
 	"sync"
 )
 
-var WrongLengthErr = errors.New("Wrong length of the packet")
+var (
+	IncorrectFormatErr = errors.New("Packet format incorrect")
+	WrongLengthErr = errors.New("Wrong length of the packet")
+)
 
 type VersionError struct {
 	Version byte
